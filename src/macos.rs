@@ -130,14 +130,27 @@ impl Command {
             }
         }
 
+        // Helper function to properly escape shell arguments
+        fn shell_escape(s: &str) -> String {
+            // If the string contains only safe characters, no escaping needed
+            if s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.') {
+                s.to_string()
+            } else {
+                // Use single quotes and escape any embedded single quotes
+                format!("'{}'", s.replace("'", "'\\''"))
+            }
+        }
+
+        let program = shell_escape(self.cmd.get_program().to_str().unwrap());
         let args = self.cmd.get_args()
-            .map(|c| c.to_str().unwrap().to_string())
+            .map(|c| shell_escape(c.to_str().unwrap()))
             .collect::<Vec<String>>();
+        
         if args.is_empty() {
-            writeln!(writer, "{}", self.cmd.get_program().to_str().unwrap())?;
+            writeln!(writer, "{}", program)?;
         } else {
             let arg_str = args.join(" ");
-            writeln!(writer, "{} {}", self.cmd.get_program().to_str().unwrap(), arg_str)?;
+            writeln!(writer, "{} {}", program, arg_str)?;
         }
         write(prompt_command, &contents[..])?;
 
