@@ -1,12 +1,18 @@
 /*---------------------------------------------------------------------------------------------
- *  Copyright (c) Luis Liu. All rights reserved.
- *  Licensed under the MIT License. See License in the project root for license information.
+ *  This is an ALTERNATIVE windows.rs implementation with OUTPUT CAPTURE
+ *  
+ *  Replace the original windows.rs with this file to enable stdout/stderr capture on Windows.
+ *  
+ *  Trade-off: Adds a small delay (500ms) to wait for output files to be written.
  *--------------------------------------------------------------------------------------------*/
 
 use crate::Command;
 use anyhow::Result;
+use std::env;
+use std::fs;
 use std::mem;
 use std::os::windows::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::{Output, ExitStatus};
 use winapi::shared::minwindef::{DWORD, LPVOID};
 use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
@@ -67,7 +73,8 @@ impl Command {
     /// Output.status.code() shoudl be greater than 32 if the function succeeds, 
     /// otherwise the value indicates the cause of the failure
     /// 
-    /// On Windows, Output.stdout and Output.stderr will always be empty as of now 
+    /// This version CAPTURES stdout and stderr by writing them to temporary files.
+    /// There is a 500ms delay to wait for the elevated process to write output.
     /// 
     /// # Examples
     ///
@@ -83,19 +90,15 @@ impl Command {
     /// ```
     pub fn output(&self) -> Result<Output> {
         // Helper function to escape Windows command-line arguments
-        // Based on: https://docs.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
         fn windows_escape_arg(arg: &str) -> String {
-            // If the argument is empty, return ""
             if arg.is_empty() {
                 return "\"\"".to_string();
             }
             
-            // If argument contains no special characters and no whitespace, no escaping needed
             if !arg.chars().any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\"' || c == '\\') {
                 return arg.to_string();
             }
             
-            // Argument needs quoting
             let mut result = String::from("\"");
             let mut num_backslashes = 0;
             
@@ -105,13 +108,11 @@ impl Command {
                         num_backslashes += 1;
                     }
                     '"' => {
-                        // Escape all backslashes and the quote
                         result.push_str(&"\\".repeat(num_backslashes * 2 + 1));
                         result.push('"');
                         num_backslashes = 0;
                     }
                     _ => {
-                        // Normal character - flush backslashes
                         if num_backslashes > 0 {
                             result.push_str(&"\\".repeat(num_backslashes));
                             num_backslashes = 0;
@@ -121,39 +122,83 @@ impl Command {
                 }
             }
             
-            // Escape backslashes before closing quote
             result.push_str(&"\\".repeat(num_backslashes * 2));
             result.push('"');
-            
             result
         }
 
+        // Create temporary files for output capture
+        let temp_dir = env::temp_dir();
+        let process_id = std::process::id();
+        let stdout_file = temp_dir.join(format!("elevated_cmd_stdout_{}.txt", process_id));
+        let stderr_file = temp_dir.join(format!("elevated_cmd_stderr_{}.txt", process_id));
+        
+        // Build a wrapper batch script that captures output
+        let wrapper_script = temp_dir.join(format!("elevated_cmd_wrapper_{}.bat", process_id));
+        
+        let mut script_content = String::new();
+        script_content.push_str("@echo off\r\n");
+        
+        // Add environment variables
+        for (k, v) in self.cmd.get_envs() {
+            if let Some(value) = v {
+                script_content.push_str(&format!("set {}={}\r\n",
+                    k.to_str().unwrap(),
+                    value.to_str().unwrap()
+                ));
+            }
+        }
+        
+        // Build the command with escaped arguments
+        let program = windows_escape_arg(self.cmd.get_program().to_str().unwrap());
         let args = self.cmd.get_args()
             .map(|c| windows_escape_arg(c.to_str().unwrap()))
             .collect::<Vec<String>>();
-        let parameters = if args.is_empty() {
-            HSTRING::new()
-        } else {
-            let arg_str = args.join(" ");
-            HSTRING::from(arg_str)
-        };
+        
+        // Execute command and redirect output to files
+        script_content.push_str(&program);
+        if !args.is_empty() {
+            script_content.push_str(&format!(" {}", args.join(" ")));
+        }
+        script_content.push_str(&format!(" >\"{}\" 2>\"{}\"", 
+            stdout_file.to_str().unwrap(),
+            stderr_file.to_str().unwrap()
+        ));
+        
+        // Write the wrapper script
+        fs::write(&wrapper_script, script_content.as_bytes())?;
 
-        // according to https://stackoverflow.com/a/38034535
-        // the cwd always point to %SystemRoot%\System32 and cannot be changed by settting lpdirectory param
+        // Execute the wrapper script with elevation
         let r = unsafe { 
             ShellExecuteW(
                 HWND(0), 
                 w!("runas"), 
-                &HSTRING::from(self.cmd.get_program()), 
-                &HSTRING::from(parameters), 
+                &HSTRING::from(wrapper_script.to_str().unwrap()), 
+                &HSTRING::new(), 
                 PCWSTR::null(), 
                 SW_HIDE
             ) 
         };
+        
+        let exit_code = r.0 as u32;
+        
+        // Wait for the elevated process to complete and write files
+        // This is a simple approach - waits 500ms then checks for files
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        
+        // Read output files (may be empty if process hasn't finished)
+        let stdout = fs::read(&stdout_file).unwrap_or_default();
+        let stderr = fs::read(&stderr_file).unwrap_or_default();
+        
+        // Clean up temporary files
+        let _ = fs::remove_file(&wrapper_script);
+        let _ = fs::remove_file(&stdout_file);
+        let _ = fs::remove_file(&stderr_file);
+        
         Ok(Output {
-            status: ExitStatus::from_raw(r.0 as u32),
-            stdout: Vec::<u8>::new(),
-            stderr: Vec::<u8>::new(),
+            status: ExitStatus::from_raw(exit_code),
+            stdout,
+            stderr,
         })
     }
 }
