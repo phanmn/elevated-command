@@ -285,21 +285,28 @@ impl Command {
 
         // Create temporary files for output capture
         let temp_dir = env::temp_dir();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let process_id = std::process::id();
-        let stdout_file = temp_dir.join(format!("elevated_cmd_stdout_{}.txt", process_id));
-        let stderr_file = temp_dir.join(format!("elevated_cmd_stderr_{}.txt", process_id));
-        let done_file = temp_dir.join(format!("elevated_cmd_done_{}.txt", process_id));
+        let unique_id = format!("{}_{}", process_id, timestamp);
         
-        // Build a wrapper batch script that captures output and signals completion
-        let wrapper_script = temp_dir.join(format!("elevated_cmd_wrapper_{}.bat", process_id));
+        let stdout_file = temp_dir.join(format!("elevated_stdout_{}.txt", unique_id));
+        let stderr_file = temp_dir.join(format!("elevated_stderr_{}.txt", unique_id));
+        let exitcode_file = temp_dir.join(format!("elevated_exit_{}.txt", unique_id));
+        
+        // Build a wrapper batch script that captures output and exit code
+        let wrapper_script = temp_dir.join(format!("elevated_wrapper_{}.bat", unique_id));
         
         let mut script_content = String::new();
         script_content.push_str("@echo off\r\n");
+        script_content.push_str("setlocal\r\n");
         
         // Add environment variables
         for (k, v) in self.cmd.get_envs() {
             if let Some(value) = v {
-                script_content.push_str(&format!("set {}={}\r\n",
+                script_content.push_str(&format!("set \"{}={}\"\r\n",
                     k.to_str().unwrap(),
                     value.to_str().unwrap()
                 ));
@@ -317,25 +324,25 @@ impl Command {
         if !args.is_empty() {
             script_content.push_str(&format!(" {}", args.join(" ")));
         }
-        script_content.push_str(&format!(" >\"{}\" 2>\"{}\"\r\n", 
+        script_content.push_str(&format!(" 1>\"{}\" 2>\"{}\"\r\n", 
             stdout_file.to_str().unwrap(),
             stderr_file.to_str().unwrap()
         ));
         
-        // Write exit code and signal completion
-        script_content.push_str(&format!("echo %ERRORLEVEL% >\"{}\"", done_file.to_str().unwrap()));
+        // Save the actual exit code (not ShellExecuteW's return value)
+        script_content.push_str(&format!("echo %ERRORLEVEL%>\"{}\"", exitcode_file.to_str().unwrap()));
         
         // Write the wrapper script
         fs::write(&wrapper_script, script_content.as_bytes())?;
 
         // Execute the wrapper script with elevation (non-blocking)
-        let wrapper_script_clone = wrapper_script.to_str().unwrap().to_string();
+        let wrapper_script_str = wrapper_script.to_str().unwrap().to_string();
         thread::spawn(move || {
             unsafe { 
                 ShellExecuteW(
                     HWND(0), 
                     w!("runas"), 
-                    &HSTRING::from(&wrapper_script_clone), 
+                    &HSTRING::from(&wrapper_script_str), 
                     &HSTRING::new(), 
                     PCWSTR::null(), 
                     SW_HIDE
@@ -349,12 +356,12 @@ impl Command {
         // Clone paths for the monitor thread
         let stdout_path = stdout_file.clone();
         let stderr_path = stderr_file.clone();
-        let done_path = done_file.clone();
+        let exitcode_path = exitcode_file.clone();
         let wrapper_path = wrapper_script.clone();
 
         // Spawn thread to monitor output files
         thread::spawn(move || {
-            monitor_output_files(tx, stdout_path, stderr_path, done_path, wrapper_path);
+            monitor_output_files_windows(tx, stdout_path, stderr_path, exitcode_path, wrapper_path);
         });
 
         Ok((
@@ -366,28 +373,43 @@ impl Command {
     }
 }
 
-// Monitor output files and send events through the channel
-fn monitor_output_files(
+// Monitor output files and send events through the channel (Windows version)
+fn monitor_output_files_windows(
     tx: Sender<CommandEvent>,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
-    done_path: PathBuf,
+    exitcode_path: PathBuf,
     wrapper_path: PathBuf,
 ) {
     let mut stdout_pos = 0u64;
     let mut stderr_pos = 0u64;
     let poll_interval = Duration::from_millis(100);
-    let max_wait = Duration::from_secs(60); // Windows UAC might take longer
+    let max_wait = Duration::from_secs(120); // Increased timeout for slow UAC
     let start = std::time::Instant::now();
 
-    // Wait a moment for UAC and script to start
-    thread::sleep(Duration::from_millis(500));
+    // Wait for UAC prompt and script to start
+    // Don't wait too long - user might still be clicking UAC
+    thread::sleep(Duration::from_millis(1000));
+
+    let mut files_appeared = false;
 
     loop {
         // Check if we've timed out
         if start.elapsed() > max_wait {
-            let _ = tx.send(CommandEvent::Error("Timeout waiting for elevated process".to_string()));
+            let _ = tx.send(CommandEvent::Error(
+                "Timeout: Process did not start or complete. UAC may have been cancelled.".to_string()
+            ));
+            // Try to clean up
+            let _ = fs::remove_file(&wrapper_path);
+            let _ = fs::remove_file(&stdout_path);
+            let _ = fs::remove_file(&stderr_path);
+            let _ = fs::remove_file(&exitcode_path);
             break;
+        }
+
+        // Check if output files exist (means process started)
+        if !files_appeared && (stdout_path.exists() || stderr_path.exists()) {
+            files_appeared = true;
         }
 
         // Try to read new stdout data
@@ -428,61 +450,68 @@ fn monitor_output_files(
             }
         }
 
-        // Check if process has finished (done file exists with exit code)
-        if let Ok(done_data) = fs::read(&done_path) {
-            if let Ok(code_str) = String::from_utf8(done_data) {
-                if let Ok(exit_code) = code_str.trim().parse::<i32>() {
-                    // Send any remaining output
-                    thread::sleep(Duration::from_millis(100));
-                    
-                    // Final stdout
-                    if let Ok(mut file) = File::open(&stdout_path) {
-                        if let Ok(metadata) = file.metadata() {
-                            let len = metadata.len();
-                            if len > stdout_pos {
-                                let mut buffer = vec![0u8; (len - stdout_pos) as usize];
-                                if file.seek(SeekFrom::Start(stdout_pos)).is_ok() {
-                                    if let Ok(n) = file.read(&mut buffer) {
-                                        buffer.truncate(n);
-                                        if !buffer.is_empty() {
-                                            let _ = tx.send(CommandEvent::Stdout(buffer));
+        // Check if process has finished (exit code file exists)
+        if exitcode_path.exists() {
+            // Give it a moment to finish writing
+            thread::sleep(Duration::from_millis(50));
+            
+            if let Ok(exitcode_data) = fs::read(&exitcode_path) {
+                if let Ok(code_str) = String::from_utf8(exitcode_data) {
+                    let code_str = code_str.trim();
+                    if !code_str.is_empty() {
+                        // Parse exit code
+                        let exit_code = code_str.parse::<i32>().ok();
+                        
+                        // Read any remaining output
+                        thread::sleep(Duration::from_millis(100));
+                        
+                        // Final stdout flush
+                        if let Ok(mut file) = File::open(&stdout_path) {
+                            if let Ok(metadata) = file.metadata() {
+                                let len = metadata.len();
+                                if len > stdout_pos {
+                                    let mut buffer = vec![0u8; (len - stdout_pos) as usize];
+                                    if file.seek(SeekFrom::Start(stdout_pos)).is_ok() {
+                                        if let Ok(n) = file.read(&mut buffer) {
+                                            buffer.truncate(n);
+                                            if !buffer.is_empty() {
+                                                let _ = tx.send(CommandEvent::Stdout(buffer));
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Final stderr
-                    if let Ok(mut file) = File::open(&stderr_path) {
-                        if let Ok(metadata) = file.metadata() {
-                            let len = metadata.len();
-                            if len > stderr_pos {
-                                let mut buffer = vec![0u8; (len - stderr_pos) as usize];
-                                if file.seek(SeekFrom::Start(stderr_pos)).is_ok() {
-                                    if let Ok(n) = file.read(&mut buffer) {
-                                        buffer.truncate(n);
-                                        if !buffer.is_empty() {
-                                            let _ = tx.send(CommandEvent::Stderr(buffer));
+                        // Final stderr flush
+                        if let Ok(mut file) = File::open(&stderr_path) {
+                            if let Ok(metadata) = file.metadata() {
+                                let len = metadata.len();
+                                if len > stderr_pos {
+                                    let mut buffer = vec![0u8; (len - stderr_pos) as usize];
+                                    if file.seek(SeekFrom::Start(stderr_pos)).is_ok() {
+                                        if let Ok(n) = file.read(&mut buffer) {
+                                            buffer.truncate(n);
+                                            if !buffer.is_empty() {
+                                                let _ = tx.send(CommandEvent::Stderr(buffer));
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Send termination event
-                    let _ = tx.send(CommandEvent::Terminated {
-                        code: Some(exit_code),
-                    });
-                    
-                    // Clean up files
-                    let _ = fs::remove_file(&stdout_path);
-                    let _ = fs::remove_file(&stderr_path);
-                    let _ = fs::remove_file(&done_path);
-                    let _ = fs::remove_file(&wrapper_path);
-                    
-                    break;
+                        // Send termination event
+                        let _ = tx.send(CommandEvent::Terminated { code: exit_code });
+                        
+                        // Clean up files
+                        let _ = fs::remove_file(&stdout_path);
+                        let _ = fs::remove_file(&stderr_path);
+                        let _ = fs::remove_file(&exitcode_path);
+                        let _ = fs::remove_file(&wrapper_path);
+                        
+                        break;
+                    }
                 }
             }
         }
