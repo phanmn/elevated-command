@@ -8,6 +8,8 @@
 //! elevated-command - Run command using `sudo`, prompting the user with a graphical OS dialog if necessary
 use std::convert::From;
 use std::process::Command as StdCommand;
+use std::path::PathBuf;
+use anyhow::Result;
 
 /// Wrap of std::process::command and escalate privileges while executing
 pub struct Command {
@@ -16,6 +18,33 @@ pub struct Command {
     icon: Option<Vec<u8>>,
     #[allow(dead_code)]
     name: Option<String>,
+}
+
+// Event types for spawn
+#[derive(Debug, Clone)]
+pub enum CommandEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Terminated { code: Option<i32> },
+    Error(String),
+}
+
+// Child process handle for spawn
+pub struct CommandChild {
+    // On macOS with elevated_command, we don't have a real child process handle
+    // because the applet runs and exits immediately, but the elevated process continues
+    // We track the output files location instead
+    _output_dir: PathBuf,
+}
+
+impl CommandChild {
+    // Note: killing the elevated process is not possible with this approach
+    // The applet has already exited, and we don't have the PID of the elevated process
+    pub fn kill(&self) -> Result<()> {
+        // Cannot kill - the applet wrapper already exited
+        // The elevated process is running independently
+        Ok(())
+    }
 }
 
 /// Command initialization shares the same logic across all the platforms
