@@ -82,8 +82,54 @@ impl Command {
     /// }
     /// ```
     pub fn output(&self) -> Result<Output> {
+        // Helper function to escape Windows command-line arguments
+        // Based on: https://docs.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+        fn windows_escape_arg(arg: &str) -> String {
+            // If the argument is empty, return ""
+            if arg.is_empty() {
+                return "\"\"".to_string();
+            }
+            
+            // If argument contains no special characters and no whitespace, no escaping needed
+            if !arg.chars().any(|c| c == ' ' || c == '\t' || c == '\n' || c == '\"' || c == '\\') {
+                return arg.to_string();
+            }
+            
+            // Argument needs quoting
+            let mut result = String::from("\"");
+            let mut num_backslashes = 0;
+            
+            for c in arg.chars() {
+                match c {
+                    '\\' => {
+                        num_backslashes += 1;
+                    }
+                    '"' => {
+                        // Escape all backslashes and the quote
+                        result.push_str(&"\\".repeat(num_backslashes * 2 + 1));
+                        result.push('"');
+                        num_backslashes = 0;
+                    }
+                    _ => {
+                        // Normal character - flush backslashes
+                        if num_backslashes > 0 {
+                            result.push_str(&"\\".repeat(num_backslashes));
+                            num_backslashes = 0;
+                        }
+                        result.push(c);
+                    }
+                }
+            }
+            
+            // Escape backslashes before closing quote
+            result.push_str(&"\\".repeat(num_backslashes * 2));
+            result.push('"');
+            
+            result
+        }
+
         let args = self.cmd.get_args()
-            .map(|c| c.to_str().unwrap().to_string())
+            .map(|c| windows_escape_arg(c.to_str().unwrap()))
             .collect::<Vec<String>>();
         let parameters = if args.is_empty() {
             HSTRING::new()
