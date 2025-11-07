@@ -360,7 +360,7 @@ impl Command {
         Ok((
             rx,
             CommandChild {
-                _temp_dir: temp_dir,
+                _output_dir: temp_dir,
             },
         ))
     }
