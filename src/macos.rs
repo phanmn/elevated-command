@@ -91,18 +91,19 @@ impl Command {
         let mut command = StdCommand::new(unzip);
         log::debug!("Applet folder: {}", path.to_str().unwrap());
                 command.current_dir(&path);
+        let app = format!("{}.app", self.name.as_ref().map_or("applet", |s| s.as_str()));
         command.args([
             "-o",
             "sudo-prompt-applet.zip",
             "-d",
-            "applet.app",
+            app.as_str(),
         ]);
         let output = command.output()?;
         if !output.status.success() {
             bail!("unzip failed: {}", output.status.to_string());
         }
 
-        let applet = path.join("applet.app");
+        let applet = path.join(app);
 
         // overwrite the icon
         if let Some(ref contents) = self.icon {
@@ -117,6 +118,7 @@ impl Command {
             "write",
             plist.to_str().unwrap(),
             "CFBundleName",
+            // "Sudo Password Prompt",
             format!("{} Password Prompt", self.name.as_ref().map_or("Sudo", |s| s.as_str())).as_str(),
         ]);
         let output = command.output()?;
@@ -199,14 +201,15 @@ impl Command {
 
         let unzip = PathBuf::from_str("/usr/bin/unzip")?;
         let mut command = StdCommand::new(unzip);
+        let app = format!("{}.app", self.name.as_ref().map_or("applet", |s| s.as_str()));
         command.current_dir(&path);
-        command.args(["-o", "sudo-prompt-applet.zip", "-d", "applet.app"]);
+        command.args(["-o", "sudo-prompt-applet.zip", "-d", app.as_str()]);
         let output = command.output()?;
         if !output.status.success() {
             bail!("unzip failed: {}", output.status.to_string());
         }
 
-        let applet = path.join("applet.app");
+        let applet = path.join(app.as_str());
 
         if let Some(ref contents) = self.icon {
             let icon = applet.join("Contents").join("Resources").join("applet.icns");
