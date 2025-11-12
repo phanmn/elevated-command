@@ -3,7 +3,8 @@
  *  
  *  Replace the original windows.rs with this file to enable stdout/stderr capture on Windows.
  *  
- *  Trade-off: Adds a small delay (500ms) to wait for output files to be written.
+ *  This version properly waits for elevated processes using ShellExecuteExW with
+ *  SEE_MASK_NOCLOSEPROCESS and WaitForSingleObject, ensuring reliable synchronization.
  *--------------------------------------------------------------------------------------------*/
 
 use crate::Command;
@@ -26,8 +27,10 @@ use winapi::um::securitybaseapi::GetTokenInformation;
 use winapi::um::winnt::{HANDLE, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::core::{HSTRING, PCWSTR, w};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{ShellExecuteW, ShellExecuteExW, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS};
+use windows::Win32::System::Threading::{WaitForSingleObject, GetExitCodeProcess, INFINITE};
 
 
 /// The implementation of state check and elevated executing varies on each platform
@@ -75,12 +78,11 @@ impl Command {
     /// Prompting the user with a graphical OS dialog for the root password, 
     /// excuting the command with escalated privileges, and return the output
     /// 
-    /// On Windows, according to https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew#return-value,
-    /// Output.status.code() shoudl be greater than 32 if the function succeeds, 
-    /// otherwise the value indicates the cause of the failure
+    /// This version properly waits for the elevated process to complete using
+    /// ShellExecuteExW with SEE_MASK_NOCLOSEPROCESS and WaitForSingleObject.
     /// 
     /// This version CAPTURES stdout and stderr by writing them to temporary files.
-    /// There is a 500ms delay to wait for the elevated process to write output.
+    /// The function blocks until the elevated process completes.
     /// 
     /// # Examples
     ///
@@ -138,6 +140,7 @@ impl Command {
         let process_id = std::process::id();
         let stdout_file = temp_dir.join(format!("elevated_cmd_stdout_{}.txt", process_id));
         let stderr_file = temp_dir.join(format!("elevated_cmd_stderr_{}.txt", process_id));
+        let exitcode_file = temp_dir.join(format!("elevated_cmd_exitcode_{}.txt", process_id));
         
         // Build a wrapper batch script that captures output
         let wrapper_script = temp_dir.join(format!("elevated_cmd_wrapper_{}.bat", process_id));
@@ -166,33 +169,74 @@ impl Command {
         if !args.is_empty() {
             script_content.push_str(&format!(" {}", args.join(" ")));
         }
-        script_content.push_str(&format!(" >\"{}\" 2>\"{}\"", 
+        script_content.push_str(&format!(" 1>\"{}\" 2>\"{}\"\r\n", 
             stdout_file.to_str().unwrap(),
             stderr_file.to_str().unwrap()
         ));
         
+        // Save the actual exit code
+        script_content.push_str(&format!("echo %ERRORLEVEL%>\"{}\"", exitcode_file.to_str().unwrap()));
+        
         // Write the wrapper script
         fs::write(&wrapper_script, script_content.as_bytes())?;
 
-        // Execute the wrapper script with elevation
-        let r = unsafe { 
-            ShellExecuteW(
-                HWND(0), 
-                w!("runas"), 
-                &HSTRING::from(wrapper_script.to_str().unwrap()), 
-                &HSTRING::new(), 
-                PCWSTR::null(), 
-                SW_HIDE
-            ) 
+        // Execute the wrapper script with elevation using ShellExecuteExW
+        let verb = w!("runas");
+        let file = HSTRING::from(wrapper_script.to_str().unwrap());
+        let params = HSTRING::new();
+        
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS,
+            hwnd: HWND(0),
+            lpVerb: PCWSTR(verb.as_ptr()),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: PCWSTR(params.as_ptr()),
+            lpDirectory: PCWSTR::null(),
+            nShow: SW_HIDE.0,
+            hInstApp: Default::default(),
+            lpIDList: std::ptr::null_mut(),
+            lpClass: PCWSTR::null(),
+            hkeyClass: Default::default(),
+            dwHotKey: 0,
+            Anonymous: Default::default(),
+            hProcess: Default::default(),
+        };
+
+        let success = unsafe { ShellExecuteExW(&mut sei) };
+        
+        if success.is_err() || sei.hProcess.is_invalid() {
+            // Clean up temporary files on failure
+            let _ = fs::remove_file(&wrapper_script);
+            let _ = fs::remove_file(&stdout_file);
+            let _ = fs::remove_file(&stderr_file);
+            let _ = fs::remove_file(&exitcode_file);
+            return Err(anyhow::anyhow!("Failed to execute elevated command"));
+        }
+
+        // Wait for the elevated process to complete
+        unsafe { 
+            WaitForSingleObject(sei.hProcess, INFINITE);
+        }
+
+        // Get the exit code from the process (this is cmd.exe's return, not the script's)
+        let mut shell_exit_code: u32 = 0;
+        unsafe {
+           let _ = GetExitCodeProcess(sei.hProcess, &mut shell_exit_code);
+        }
+
+        // Read the actual command exit code from the file
+        let actual_exit_code = if let Ok(exitcode_data) = fs::read(&exitcode_file) {
+            if let Ok(code_str) = String::from_utf8(exitcode_data) {
+                code_str.trim().parse::<i32>().unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
         };
         
-        let exit_code = r.0 as u32;
-        
-        // Wait for the elevated process to complete and write files
-        // This is a simple approach - waits 500ms then checks for files
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        
-        // Read output files (may be empty if process hasn't finished)
+        // Read output files
         let stdout = fs::read(&stdout_file).unwrap_or_default();
         let stderr = fs::read(&stderr_file).unwrap_or_default();
         
@@ -200,9 +244,10 @@ impl Command {
         let _ = fs::remove_file(&wrapper_script);
         let _ = fs::remove_file(&stdout_file);
         let _ = fs::remove_file(&stderr_file);
+        let _ = fs::remove_file(&exitcode_file);
         
         Ok(Output {
-            status: ExitStatus::from_raw(exit_code),
+            status: ExitStatus::from_raw(actual_exit_code as u32),
             stdout,
             stderr,
         })
